@@ -1,0 +1,143 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.21'
+
+    - name: Cache Go modules
+      uses: actions/cache@v3
+      with:
+        path: ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+
+    - name: Download dependencies
+      run: go mod download
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract version from tag
+      id: version
+      run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+    - name: Build binaries
+      run: |
+        # Build for multiple platforms
+        GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o proxy-server-linux-amd64 .
+        GOOS=linux GOARCH=arm64 go build -ldflags="-w -s" -o proxy-server-linux-arm64 .
+        GOOS=darwin GOARCH=amd64 go build -ldflags="-w -s" -o proxy-server-darwin-amd64 .
+        GOOS=darwin GOARCH=arm64 go build -ldflags="-w -s" -o proxy-server-darwin-arm64 .
+        GOOS=windows GOARCH=amd64 go build -ldflags="-w -s" -o proxy-server-windows-amd64.exe .
+
+    - name: Create checksums
+      run: |
+        sha256sum proxy-server-* > checksums.txt
+
+    - name: Extract metadata for Docker
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=semver,pattern={{major}}
+          type=raw,value=latest
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+
+    - name: Generate Release Notes
+      id: release_notes
+      run: |
+        # Get the previous tag
+        PREVIOUS_TAG=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || echo "")
+        
+        # Generate changelog
+        if [ -n "$PREVIOUS_TAG" ]; then
+          echo "## What's Changed" > release_notes.md
+          echo "" >> release_notes.md
+          git log --pretty=format:"* %s (%h)" $PREVIOUS_TAG..HEAD >> release_notes.md
+          echo "" >> release_notes.md
+          echo "" >> release_notes.md
+        else
+          echo "## Initial Release" > release_notes.md
+          echo "" >> release_notes.md
+        fi
+        
+        echo "## Docker Images" >> release_notes.md
+        echo "" >> release_notes.md
+        echo "### GitHub Container Registry" >> release_notes.md
+        echo '```bash' >> release_notes.md
+        echo "docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}" >> release_notes.md
+        echo "docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest" >> release_notes.md
+        echo '```' >> release_notes.md
+        echo "" >> release_notes.md
+        echo "## Usage" >> release_notes.md
+        echo '```bash' >> release_notes.md
+        echo "docker run -d \\" >> release_notes.md
+        echo "  --name proxy-server \\" >> release_notes.md
+        echo "  -p 8080:8080 \\" >> release_notes.md
+        echo "  -e PROXY_USERNAME=admin \\" >> release_notes.md
+        echo "  -e PROXY_PASSWORD=mypassword \\" >> release_notes.md
+        echo "  ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}" >> release_notes.md
+        echo '```' >> release_notes.md
+        echo "" >> release_notes.md
+        echo "## Supported Platforms" >> release_notes.md
+        echo "- linux/amd64" >> release_notes.md
+        echo "- linux/arm64" >> release_notes.md
+        echo "- darwin/amd64 (macOS Intel)" >> release_notes.md
+        echo "- darwin/arm64 (macOS Apple Silicon)" >> release_notes.md
+        echo "- windows/amd64" >> release_notes.md
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ steps.version.outputs.VERSION }}
+        name: Release ${{ steps.version.outputs.VERSION }}
+        body_path: release_notes.md
+        files: |
+          proxy-server-*
+          checksums.txt
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
